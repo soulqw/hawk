@@ -139,7 +139,7 @@ enum ToolDialect: String, CaseIterable, Sendable, Identifiable {
 
 // MARK: - 工具定义
 
-enum AgentTool: String, CaseIterable, Sendable, Identifiable {
+enum AgentTool: String, CaseIterable, Sendable, Identifiable, Codable {
     case listDir = "list_dir"
     case readFile = "read_file"
     case editFile = "edit_file"
@@ -204,8 +204,8 @@ struct ToolInvocation: Identifiable, Equatable, Sendable {
 }
 
 /// 一次工具调用的执行记录（用于展示）。
-struct ToolRun: Identifiable, Equatable, Sendable {
-    enum Status: Equatable, Sendable {
+struct ToolRun: Identifiable, Equatable, Sendable, Codable {
+    enum Status: Equatable, Sendable, Codable {
         case running
         case waitingApproval
         case succeeded
@@ -243,7 +243,7 @@ struct ToolRun: Identifiable, Equatable, Sendable {
 }
 
 /// 一次文件改动的前后对照，用于 diff 预览。
-struct FileChange: Equatable, Sendable {
+struct FileChange: Equatable, Sendable, Codable {
     var path: String
     var before: String
     var after: String
@@ -256,9 +256,9 @@ struct FileChange: Equatable, Sendable {
     var diffLines: [DiffLine] { DiffEngine.lines(before: before, after: after) }
 }
 
-struct DiffLine: Identifiable, Equatable, Sendable {
-    enum Kind: Equatable, Sendable { case context, inserted, removed }
-    let id = UUID()
+struct DiffLine: Identifiable, Equatable, Sendable, Codable {
+    enum Kind: Equatable, Sendable, Codable { case context, inserted, removed }
+    var id = UUID()
     var kind: Kind
     var text: String
     var oldNumber: Int?
@@ -311,8 +311,8 @@ struct ChatMessage: Equatable, Sendable {
 // MARK: - 展示用转录
 
 /// 界面上的一行记录。
-struct TranscriptItem: Identifiable, Equatable, Sendable {
-    enum Kind: Equatable, Sendable {
+struct TranscriptItem: Identifiable, Equatable, Sendable, Codable {
+    enum Kind: Equatable, Sendable, Codable {
         case user(String)
         case assistant(String)
         case thinking(String)
@@ -324,6 +324,7 @@ struct TranscriptItem: Identifiable, Equatable, Sendable {
 
     var id = UUID()
     var kind: Kind
+    var createdAt = Date()
 
     static func user(_ text: String) -> TranscriptItem { TranscriptItem(kind: .user(text)) }
     static func assistant(_ text: String) -> TranscriptItem { TranscriptItem(kind: .assistant(text)) }
@@ -331,6 +332,49 @@ struct TranscriptItem: Identifiable, Equatable, Sendable {
     static func error(_ text: String) -> TranscriptItem { TranscriptItem(kind: .error(text)) }
     static func summary(_ text: String) -> TranscriptItem { TranscriptItem(kind: .summary(text)) }
     static func tool(_ run: ToolRun) -> TranscriptItem { TranscriptItem(kind: .tool(run)) }
+
+    /// 用于构造多轮上下文的纯文本。工具条目属于内部细节，不进入对话历史。
+    var dialogueText: String? {
+        switch kind {
+        case .user(let text), .summary(let text):
+            return text
+        default:
+            return nil
+        }
+    }
+}
+
+// MARK: - 会话
+
+/// 一次会话：聊天记录 + 完整执行日志，整体落盘，便于回溯。
+struct ConversationSession: Identifiable, Equatable, Sendable, Codable {
+    var id: UUID
+    var title: String
+    var createdAt: Date
+    var updatedAt: Date
+    var workspacePath: String
+    var items: [TranscriptItem]
+
+    init(id: UUID = UUID(), title: String = "新会话", workspacePath: String = "") {
+        self.id = id
+        self.title = title
+        self.createdAt = Date()
+        self.updatedAt = Date()
+        self.workspacePath = workspacePath
+        self.items = []
+    }
+
+    /// 会话中已完成的任务轮数（用户输入条数）。
+    var turnCount: Int {
+        items.reduce(0) { partial, item in
+            if case .user(_) = item.kind { return partial + 1 }
+            return partial
+        }
+    }
+
+    var characterCount: Int {
+        items.reduce(0) { $0 + ($1.dialogueText?.count ?? 0) }
+    }
 }
 
 // MARK: - Agent 事件

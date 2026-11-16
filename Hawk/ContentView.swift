@@ -6,13 +6,13 @@ struct ContentView: View {
     @State private var showingSettings = false
     @State private var showingLogs = false
     @State private var showingSkills = false
+    @State private var showingContext = false
 
     var body: some View {
         NavigationSplitView {
             SidebarView(
                 vm: vm,
                 onOpenSettings: { showingSettings = true },
-                onOpenLogs: { showingLogs = true },
                 onOpenSkills: { showingSkills = true }
             )
                 .navigationSplitViewColumnWidth(min: 210, ideal: 250, max: 320)
@@ -52,6 +52,29 @@ struct ContentView: View {
                     }
             }
         }
+        .sheet(isPresented: $showingContext) {
+            NavigationStack {
+                ContextView(vm: vm)
+                    .frame(minWidth: 640, minHeight: 620)
+                    .toolbar {
+                        ToolbarItem(placement: .primaryAction) {
+                            Button("完成") { showingContext = false }
+                        }
+                    }
+            }
+        }
+        .sheet(
+            item: Binding(
+                get: { vm.pendingApproval },
+                set: { vm.pendingApproval = $0 }
+            )
+        ) { request in
+            ApprovalSheet(
+                request: request,
+                onApprove: { vm.approvePending() },
+                onDeny: { vm.denyPending() }
+            )
+        }
         .onChange(of: vm.settings) { _, _ in vm.saveSettings() }
         .onAppear {
             vm.refreshModels()
@@ -59,14 +82,6 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItemGroup {
-                Button {
-                    vm.newSession()
-                } label: {
-                    Label("新建会话", systemImage: "square.and.pencil")
-                }
-                .disabled(vm.isRunning)
-                .help("清空当前转录，开始新任务")
-
                 if vm.isRunning {
                     Button {
                         vm.stop()
@@ -77,13 +92,36 @@ struct ContentView: View {
                     .help("中止当前任务（⌘.）")
                 }
 
-                Button {
-                    vm.refreshModels()
+                Menu {
+                    Button {
+                        vm.chooseWorkspace()
+                    } label: {
+                        Label("选择工作区", systemImage: "folder")
+                    }
+
+                    Button {
+                        showingContext = true
+                    } label: {
+                        Label("上下文管理", systemImage: "gauge.with.dots.needle.33percent")
+                    }
+
+                    Button {
+                        showingLogs = true
+                    } label: {
+                        Label("查看日志", systemImage: "doc.text.magnifyingglass")
+                    }
+
+                    Divider()
+
+                    Button {
+                        vm.refreshModels()
+                    } label: {
+                        Label("刷新模型", systemImage: "arrow.clockwise")
+                    }
                 } label: {
-                    Label("刷新模型", systemImage: "arrow.clockwise")
+                    Label("更多", systemImage: "ellipsis.circle")
                 }
-                .disabled(vm.isRefreshingModels)
-                .help("重新读取 /v1/models")
+                .help("工作区、上下文和日志入口")
             }
         }
     }
@@ -112,7 +150,7 @@ private struct RunHeader: View {
                 .foregroundStyle(vm.isRunning ? Color.accentColor : Color.secondary)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(vm.model)
+                Text(vm.isRunning ? "正在执行任务" : "准备就绪")
                     .font(.system(size: 12, weight: .semibold))
                 Text(vm.workspacePath.isEmpty ? "未选择工作区" : (vm.workspacePath as NSString).lastPathComponent)
                     .font(.system(size: 11))
@@ -157,27 +195,31 @@ private struct Composer: View {
         VStack(alignment: .leading, spacing: 8) {
             attachmentBar
 
-            TextEditor(text: $vm.taskInput)
-                .font(.system(size: 13))
-                .scrollContentBackground(.hidden)
-                .padding(6)
-                .frame(minHeight: 64, maxHeight: 160)
-                .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor)))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .strokeBorder(isDropTargeted ? Color.accentColor.opacity(0.75) : Color.primary.opacity(0.12), lineWidth: isDropTargeted ? 2 : 1)
-                )
-                .overlay(alignment: .topLeading) {
-                    if vm.taskInput.isEmpty {
-                        Text("输入你的需求，例如：修复 calc.py 里除以零会导致崩溃的问题，并跑通测试")
-                            .font(.system(size: 13))
-                            .foregroundStyle(.tertiary)
-                            .padding(.horizontal, 11)
-                            .padding(.vertical, 14)
-                            .allowsHitTesting(false)
-                    }
+            ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+
+                TextEditor(text: $vm.taskInput)
+                    .font(.system(size: 13))
+                    .scrollContentBackground(.hidden)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 8)
+
+                if vm.taskInput.isEmpty {
+                    Text("输入任何你的问题。")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.tertiary)
+                        .padding(.leading, 11)
+                        .padding(.top, 14)
+                        .allowsHitTesting(false)
                 }
-                .overlay(alignment: .bottomLeading) {
+            }
+            .frame(minHeight: 64, maxHeight: 160)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(isDropTargeted ? Color.accentColor.opacity(0.75) : Color.primary.opacity(0.12), lineWidth: isDropTargeted ? 2 : 1)
+            )
+            .overlay(alignment: .bottomLeading) {
                     if isDropTargeted {
                         Label("松手即可附加文件并授权模型访问", systemImage: "paperclip.circle.fill")
                             .font(.caption)
@@ -187,9 +229,9 @@ private struct Composer: View {
                             .padding(10)
                     }
                 }
-                .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isDropTargeted) { providers in
-                    vm.handleDroppedFileProviders(providers)
-                }
+            .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isDropTargeted) { providers in
+                vm.handleDroppedFileProviders(providers)
+            }
 
             HStack(spacing: 10) {
                 if vm.workspacePath.isEmpty {
@@ -289,70 +331,143 @@ private struct Composer: View {
 private struct SidebarView: View {
     @Bindable var vm: AppViewModel
     let onOpenSettings: () -> Void
-    let onOpenLogs: () -> Void
     let onOpenSkills: () -> Void
 
     var body: some View {
         List {
-            Section("工作区") {
-                if vm.workspacePath.isEmpty {
-                    Text("尚未选择")
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(vm.workspacePath)
-                        .font(.system(size: 11, design: .monospaced))
-                        .lineLimit(3)
-                        .truncationMode(.middle)
-                        .textSelection(.enabled)
+            Section {
+                ForEach(vm.allSessions) { item in
+                    SessionSidebarRow(
+                        vm: vm,
+                        session: item,
+                        isCurrent: item.id == vm.session.id
+                    )
                 }
-                Button {
-                    vm.chooseWorkspace()
-                } label: {
-                    Label("选择文件夹…", systemImage: "folder")
+            } header: {
+                HStack(spacing: 8) {
+                    Text("会话")
+                    Spacer()
+                    Button {
+                        vm.startNewSession()
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(vm.isRunning)
+                    .help("新增会话")
                 }
             }
 
-            Section("当前环境") {
-                Label(vm.model, systemImage: "cpu")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Label(vm.providerID.uppercased(), systemImage: "network")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Label(vm.fileAccessSummary, systemImage: "paperclip")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Skills") {
+            Section("Skill") {
                 Button(action: onOpenSkills) {
                     Label("打开技能中心", systemImage: "sparkles.rectangle.stack")
                 }
                 .buttonStyle(.plain)
-
-                Label(vm.skillsSummary, systemImage: "shippingbox")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
 
-            Section("更多") {
-                Button(action: onOpenLogs) {
-                    Label("查看日志", systemImage: "doc.text.magnifyingglass")
-                }
-                .buttonStyle(.plain)
-
+            Section("设置") {
                 Button(action: onOpenSettings) {
                     Label("打开设置", systemImage: "slider.horizontal.3")
                 }
                 .buttonStyle(.plain)
-
-                Label("代码改动和命令执行会直接继续处理", systemImage: "bolt.fill")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
         }
         .listStyle(.sidebar)
     }
+}
+
+// MARK: - 侧边栏 · 会话行
+
+/// 侧边栏里的单个会话：点击切换，右键删除；当前会话只做标记不可点。
+private struct SessionSidebarRow: View {
+    @Bindable var vm: AppViewModel
+    let session: ConversationSession
+    let isCurrent: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button {
+                guard !isCurrent, !vm.isRunning else { return }
+                vm.loadSession(session)
+            } label: {
+                rowMain
+            }
+            .buttonStyle(.plain)
+            .disabled(vm.isRunning)
+
+            Button {
+                vm.renameSession(session)
+            } label: {
+                Image(systemName: "pencil")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help("重命名会话")
+
+            if !isCurrent {
+                Button {
+                    vm.deleteSession(session)
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help("删除会话")
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(isCurrent ? Color.accentColor.opacity(0.14) : Color.clear)
+        )
+        .contextMenu {
+            Button("重命名会话") {
+                vm.renameSession(session)
+            }
+        }
+    }
+
+    private var rowMain: some View {
+        HStack(spacing: 8) {
+            Image(systemName: isCurrent ? "bubble.left.and.bubble.right.fill" : "bubble.left.and.bubble.right")
+                .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary)
+                .font(.system(size: 12))
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Text(session.title)
+                        .font(.system(size: 12, weight: isCurrent ? .semibold : .regular))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if isCurrent {
+                        Text("（当前）")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(Color.accentColor)
+                            .lineLimit(1)
+                    }
+                }
+                Text(subtitle)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 4)
+        }
+    }
+
+    private var subtitle: String {
+        "\(session.turnCount) 轮 · \(Self.formatter.string(from: session.updatedAt))"
+    }
+
+    private static let formatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MM-dd HH:mm"
+        return formatter
+    }()
 }
 
 // MARK: - 人工审批
@@ -385,22 +500,39 @@ private struct ApprovalSheet: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    switch request.action {
-                    case .command(let command):
+                    if !request.detail.isEmpty {
+                        Text(request.detail)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    switch request.intent {
+                    case .execute(.command(_, _, let displayText)):
                         Label("将执行以下命令", systemImage: "terminal")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
-                        Text(command)
+                        Text(displayText)
                             .font(.system(size: 12, design: .monospaced))
                             .textSelection(.enabled)
                             .padding(10)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .controlBackgroundColor)))
 
-                    case .write:
+                    case .execute(.write(_)):
                         if let change = request.change {
                             DiffView(change: change)
                         }
+
+                    case .authorizePath(let path):
+                        Label("将申请访问以下路径", systemImage: "folder.badge.questionmark")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Text(path)
+                            .font(.system(size: 12, design: .monospaced))
+                            .textSelection(.enabled)
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .controlBackgroundColor)))
                     }
                 }
                 .padding(16)
@@ -415,7 +547,7 @@ private struct ApprovalSheet: View {
                 Spacer()
                 Button("拒绝", role: .cancel) { onDeny() }
                     .keyboardShortcut(.escape, modifiers: [])
-                Button("允许并执行") { onApprove() }
+                Button(request.confirmTitle) { onApprove() }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.return, modifiers: [])
             }

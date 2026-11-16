@@ -52,7 +52,7 @@ struct PlanRejection: Error, ExpressibleByStringInterpolation {
 /// 待确认的动作。
 enum PendingAction: Sendable {
     case write(WritePlan)
-    case command(String)
+    case command(command: String, workingDirectory: String?, displayText: String)
 }
 
 /// 工具执行前的判定结果。
@@ -123,12 +123,25 @@ struct AgentTools: Sendable {
             return wrap(outcome)
 
         case .runCommand:
-            let command = arguments["command"]?.stringValue ?? ""
-            let verdict = safety.checkCommand(command)
-            guard verdict.allowed else {
-                return .ready(.failure("DENIED: \(verdict.reason)"))
+            let rawCommand = arguments["command"]?.stringValue ?? ""
+            let prepared = prepareCommand(rawCommand)
+            switch prepared {
+            case .failure(let rejection):
+                return .ready(.failure(rejection.message))
+            case .success(let plan):
+                let verdict = safety.checkCommand(plan.command)
+                guard verdict.allowed else {
+                    return .ready(.failure("DENIED: \(verdict.reason)"))
+                }
+                return .pending(
+                    .command(
+                        command: plan.command,
+                        workingDirectory: plan.workingDirectory,
+                        displayText: plan.displayText
+                    ),
+                    nil
+                )
             }
-            return .pending(.command(command), nil)
         }
     }
 
@@ -147,9 +160,85 @@ struct AgentTools: Sendable {
         switch action {
         case .write(let plan):
             return commitWrite(plan)
-        case .command(let command):
-            return runCommand(command)
+        case .command(let command, let workingDirectory, _):
+            return runCommand(command, workingDirectory: workingDirectory)
         }
+    }
+
+    func overrideCommandAction(from rawCommand: String) -> Result<PendingAction, PlanRejection> {
+        let prepared = prepareCommand(rawCommand)
+        switch prepared {
+        case .failure(let rejection):
+            return .failure(rejection)
+        case .success(let plan):
+            let verdict = safety.checkCommand(plan.command)
+            if verdict.allowed {
+                return .success(
+                    .command(
+                        command: plan.command,
+                        workingDirectory: plan.workingDirectory,
+                        displayText: plan.displayText
+                    )
+                )
+            }
+
+            if verdict.reason.contains("危险命令规则") || verdict.reason.contains("管道、重定向") {
+                return .failure("DENIED: \(verdict.reason)")
+            }
+
+            return .success(
+                .command(
+                    command: plan.command,
+                    workingDirectory: plan.workingDirectory,
+                    displayText: plan.displayText
+                )
+            )
+        }
+    }
+
+    private struct PreparedCommand: Sendable {
+        var command: String
+        var workingDirectory: String?
+        var displayText: String
+    }
+
+    private func prepareCommand(_ rawCommand: String) -> Result<PreparedCommand, PlanRejection> {
+        let trimmed = rawCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .failure("ERROR: 空命令") }
+
+        let marker = "&&"
+        if trimmed.hasPrefix("cd "), let range = trimmed.range(of: marker) {
+            let left = String(trimmed[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let right = String(trimmed[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+
+            let rawPath = left.dropFirst(2).trimmingCharacters(in: .whitespacesAndNewlines)
+            let path = rawPath.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            guard !path.isEmpty, !right.isEmpty else {
+                return .failure("ERROR: 命令解析失败: \(rawCommand)")
+            }
+
+            do {
+                let workingDirectory = try safety.resolvePath(path)
+                let displayText = "工作目录：\(workingDirectory)\n命令：\(right)"
+                return .success(
+                    PreparedCommand(
+                        command: right,
+                        workingDirectory: workingDirectory,
+                        displayText: displayText
+                    )
+                )
+            } catch {
+                return .failure("DENIED: \(error.localizedDescription)")
+            }
+        }
+
+        return .success(
+            PreparedCommand(
+                command: trimmed,
+                workingDirectory: nil,
+                displayText: trimmed
+            )
+        )
     }
 
     private func commitWrite(_ plan: WritePlan) -> ToolExecutionResult {
@@ -360,12 +449,13 @@ struct AgentTools: Sendable {
 
     // MARK: - 执行命令
 
-    private func runCommand(_ command: String) -> ToolExecutionResult {
+    private func runCommand(_ command: String, workingDirectory: String?) -> ToolExecutionResult {
         guard let argv = SafetyGuard.shellSplit(command), !argv.isEmpty else {
             return .failure("ERROR: 命令解析失败: \(command)")
         }
 
-        let outcome = Self.runProcess(argv: argv, cwd: workspace, timeout: 180)
+        let cwd = workingDirectory ?? workspace
+        let outcome = Self.runProcess(argv: argv, cwd: cwd, timeout: 180)
         if outcome.timedOut {
             return .failure("ERROR: 命令执行超时（180s）")
         }
@@ -527,9 +617,9 @@ struct AgentTools: Sendable {
             ),
             function(
                 name: AgentTool.runCommand.rawValue,
-                description: "在 workspace 根目录执行命令，用于跑测试、跑 lint、查看文件。受白名单与危险命令规则限制，不支持管道与重定向。",
+                description: "执行单条命令，用于跑测试、跑 lint、查看文件。默认在 workspace 根目录执行；如果确实要切目录，只允许 `cd 目录 && 命令` 这一种形式，不能再拼接别的 shell 语法。",
                 properties: [
-                    "command": ["type": "string", "description": "完整命令，例如 python3 test_calc.py"],
+                    "command": ["type": "string", "description": "完整命令，例如 python3 test_calc.py；若需切目录，只写 `cd 子目录 && ./gradlew test` 这种单次切换"],
                 ],
                 required: ["command"]
             ),

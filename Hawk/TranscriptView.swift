@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // MARK: - 转录列表
@@ -23,6 +24,7 @@ struct TranscriptView: View {
                 }
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
             }
             .onChange(of: vm.scrollTick) { _, _ in
                 withAnimation(.easeOut(duration: 0.15)) {
@@ -42,8 +44,9 @@ struct TranscriptView: View {
         switch item.kind {
         case .user(let text):
             MessageBubble(text: text, roleTitle: "你", symbol: "person.fill", tint: .accentColor, alignTrailing: true)
-        case .assistant(let text):
-            MessageBubble(text: text, roleTitle: "模型", symbol: "cpu", tint: .secondary, alignTrailing: false)
+        case .assistant:
+            // 模型中间过程属于内部细节，只在日志中心可见。
+            EmptyView()
         case .thinking:
             EmptyView()
         case .tool:
@@ -65,7 +68,7 @@ private struct EmptyHint: View {
                 .font(.title3.weight(.semibold))
             Text("在左侧选择工作区，必要时打开设置，然后直接发送你的需求。")
                 .foregroundStyle(.secondary)
-            Text("执行过程中不会刷出内部工具细节，只展示当前状态和最后的结果。涉及写文件或执行命令时，仍然会向你确认。")
+            Text("执行过程中只展示当前状态，结束后给出结果摘要；完整过程可在「查看日志」里回溯。")
                 .font(.callout)
                 .foregroundStyle(.tertiary)
         }
@@ -108,9 +111,13 @@ private struct MessageBubble: View {
 
     private var content: some View {
         VStack(alignment: alignTrailing ? .trailing : .leading, spacing: 4) {
-            Text(roleTitle)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.tertiary)
+            HStack(spacing: 6) {
+                if alignTrailing { CopyButton(text: text) }
+                Text(roleTitle)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                if !alignTrailing { CopyButton(text: text) }
+            }
             Text(text)
                 .font(.system(size: 13))
                 .textSelection(.enabled)
@@ -196,6 +203,7 @@ private struct ResultCard: View {
                 Text(title)
                     .font(.system(size: 14, weight: .semibold))
                 Spacer()
+                CopyButton(text: text)
             }
 
             ForEach(ResultBlock.parse(text)) { block in
@@ -223,7 +231,14 @@ private struct ResultCard: View {
 
         VStack(alignment: .leading, spacing: 8) {
             ForEach(Array(paragraphs.enumerated()), id: \.offset) { _, paragraph in
-                if isBullet(paragraph) {
+                if let fileResult = parseFileResult(paragraph) {
+                    FileResultRow(action: fileResult.action, path: fileResult.path, tint: tint)
+                } else if isSectionTitle(paragraph) {
+                    Text(paragraph)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else if isBullet(paragraph) {
                     HStack(alignment: .top, spacing: 8) {
                         Circle()
                             .fill(tint)
@@ -245,24 +260,11 @@ private struct ResultCard: View {
     }
 
     private func codeBlock(_ content: String, language: String?) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label(language?.isEmpty == false ? language! : "代码片段", systemImage: "chevron.left.forwardslash.chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-            }
+        CodeBlockView(content: content, language: language)
+    }
 
-            ScrollView(.horizontal) {
-                Text(content)
-                    .font(.system(size: 12, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
-            }
-            .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .textBackgroundColor)))
-            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.primary.opacity(0.08), lineWidth: 1))
-        }
+    private func isSectionTitle(_ text: String) -> Bool {
+        text.hasSuffix("：") && !isBullet(text)
     }
 
     private func isBullet(_ text: String) -> Bool {
@@ -274,6 +276,214 @@ private struct ResultCard: View {
             return String(text.dropFirst(2))
         }
         return text.replacingOccurrences(of: #"^\d+\.\s+"#, with: "", options: .regularExpression)
+    }
+
+    private func parseFileResult(_ text: String) -> (action: String, path: String)? {
+        let cleaned = cleanBullet(text)
+        let patterns = ["已创建", "已修改"]
+        for pattern in patterns {
+            let prefix = "\(pattern)："
+            if cleaned.hasPrefix(prefix) {
+                let path = String(cleaned.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard path.hasPrefix("/") else { return nil }
+                return (pattern, path)
+            }
+        }
+        return nil
+    }
+
+}
+
+private struct FileResultRow: View {
+    let action: String
+    let path: String
+    let tint: Color
+
+    private var fileName: String { URL(fileURLWithPath: path).lastPathComponent }
+
+    var body: some View {
+        Button {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+        } label: {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "doc.text.fill")
+                    .foregroundStyle(tint)
+                    .padding(.top, 1)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("\(action)：\(fileName)")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(path)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .lineLimit(2)
+                }
+
+                Text("定位")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .textBackgroundColor)))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(tint.opacity(0.14), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .help("在 Finder 中定位这个文件")
+    }
+}
+
+/// 一键复制：整段内容进剪贴板，避免只能逐块选中。
+struct CopyButton: View {
+    let text: String
+    var title: String = "复制"
+    var helpText: String = "复制全部内容"
+    @State private var copied = false
+
+    var body: some View {
+        Button {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
+            copied = true
+            Task {
+                try? await Task.sleep(nanoseconds: 1_400_000_000)
+                copied = false
+            }
+        } label: {
+            Label(copied ? "已复制" : title, systemImage: copied ? "checkmark" : "doc.on.doc")
+                .font(.caption2)
+                .labelStyle(.titleAndIcon)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(copied ? Color.green : Color.secondary)
+        .help(helpText)
+    }
+}
+
+private struct CodeBlockView: View {
+    let content: String
+    let language: String?
+
+    private var displayedLanguage: String {
+        let trimmed = language?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "代码片段" : trimmed
+    }
+
+    private var highlightedText: AttributedString {
+        CodeSyntaxHighlighter.highlight(content, language: language)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label(displayedLanguage, systemImage: "chevron.left.forwardslash.chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                CopyButton(text: content, title: "复制代码", helpText: "复制这段代码")
+            }
+
+            ScrollView(.horizontal) {
+                Text(highlightedText)
+                    .textSelection(.enabled)
+                    .font(.system(size: 12, design: .monospaced))
+                    .fixedSize(horizontal: true, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+            }
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .textBackgroundColor)))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.primary.opacity(0.08), lineWidth: 1))
+        }
+    }
+}
+
+private enum CodeSyntaxHighlighter {
+    static func highlight(_ code: String, language: String?) -> AttributedString {
+        let ns = NSMutableAttributedString(string: code)
+        let fullRange = NSRange(location: 0, length: ns.length)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineHeightMultiple = 1.12
+
+        ns.addAttributes([
+            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+            .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: paragraph
+        ], range: fullRange)
+
+        if inferredLanguage(language, code: code) == "xml" {
+            applyXMLHighlights(to: ns, code: code)
+        } else {
+            applyGenericHighlights(to: ns, code: code, language: inferredLanguage(language, code: code))
+        }
+
+        return AttributedString(ns)
+    }
+
+    private static func inferredLanguage(_ language: String?, code: String) -> String {
+        let trimmed = language?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if !trimmed.isEmpty { return trimmed }
+
+        let sample = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        if sample.hasPrefix("<?xml") || sample.hasPrefix("<") { return "xml" }
+        if sample.contains("import SwiftUI") || sample.contains("let ") || sample.contains("var ") { return "swift" }
+        if sample.contains("public class ") || sample.contains("System.out.println") { return "java" }
+        if sample.contains("fun ") || sample.contains("val ") { return "kotlin" }
+        if sample.contains("def ") || sample.contains("print(") { return "python" }
+        if sample.hasPrefix("{") || sample.hasPrefix("[") { return "json" }
+        return "plain"
+    }
+
+    private static func applyGenericHighlights(to text: NSMutableAttributedString, code: String, language: String) {
+        let keywordSets: [String: [String]] = [
+            "swift": ["import", "struct", "class", "enum", "protocol", "extension", "func", "let", "var", "if", "else", "guard", "return", "for", "in", "while", "switch", "case", "default", "private", "fileprivate", "internal", "public", "open", "static", "async", "await", "throw", "throws", "try", "nil", "true", "false"],
+            "java": ["package", "import", "public", "private", "protected", "class", "interface", "enum", "static", "final", "void", "int", "long", "float", "double", "boolean", "char", "new", "return", "if", "else", "for", "while", "switch", "case", "break", "continue", "try", "catch", "throws", "throw", "null", "true", "false", "this"],
+            "kotlin": ["package", "import", "class", "interface", "object", "data", "fun", "val", "var", "if", "else", "when", "for", "while", "return", "null", "true", "false", "private", "public", "internal", "protected", "override", "suspend", "try", "catch", "throw", "this"],
+            "python": ["import", "from", "class", "def", "return", "if", "elif", "else", "for", "while", "in", "is", "not", "and", "or", "None", "True", "False", "try", "except", "finally", "with", "as", "pass", "break", "continue"],
+            "json": [],
+            "plain": []
+        ]
+
+        let keywords = keywordSets[language] ?? []
+        if !keywords.isEmpty {
+            let pattern = "\\b(" + keywords.joined(separator: "|") + ")\\b"
+            apply(pattern: pattern, in: code, to: text, color: .systemPurple)
+        }
+
+        apply(pattern: #"(?<!\w)[A-Z][A-Za-z0-9_]*"#, in: code, to: text, color: .systemTeal)
+        apply(pattern: #"\b\d+(\.\d+)?\b"#, in: code, to: text, color: .systemOrange)
+        apply(pattern: #""(?:\\.|[^"\\])*""#, in: code, to: text, color: .systemRed)
+        apply(pattern: #"'(?:\\.|[^'\\])*'"#, in: code, to: text, color: .systemRed)
+        apply(pattern: #"@[A-Za-z_][A-Za-z0-9_]*"#, in: code, to: text, color: .systemBlue)
+
+        switch language {
+        case "python":
+            apply(pattern: #"(?m)#.*$"#, in: code, to: text, color: .systemGreen)
+        default:
+            apply(pattern: #"(?m)//.*$"#, in: code, to: text, color: .systemGreen)
+            apply(pattern: #"/\*[\s\S]*?\*/"#, in: code, to: text, color: .systemGreen)
+        }
+    }
+
+    private static func applyXMLHighlights(to text: NSMutableAttributedString, code: String) {
+        apply(pattern: #"<!--[\s\S]*?-->"#, in: code, to: text, color: .systemGreen)
+        apply(pattern: #"</?[A-Za-z_:][A-Za-z0-9_.:-]*"#, in: code, to: text, color: .systemBlue)
+        apply(pattern: #"\s[A-Za-z_:][A-Za-z0-9_.:-]*(?=\=)"#, in: code, to: text, color: .systemPurple)
+        apply(pattern: #""[^"]*""#, in: code, to: text, color: .systemRed)
+    }
+
+    private static func apply(pattern: String, in code: String, to text: NSMutableAttributedString, color: NSColor) {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return }
+        let range = NSRange(code.startIndex..<code.endIndex, in: code)
+        for match in regex.matches(in: code, options: [], range: range) {
+            text.addAttribute(.foregroundColor, value: color, range: match.range)
+        }
     }
 }
 

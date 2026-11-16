@@ -31,14 +31,15 @@ struct AgentEngine: Sendable {
     1. 先观察再动手：第一步用 list_dir 了解项目结构，不要凭空猜测文件内容。
     2. 改文件前必须先 read_file 看到原文，edit_file 的 old_string 必须与原文逐字符一致。
     3. 一次只做一件小事，做完立刻用 run_cmd 验证（例如 python3 test_calc.py）。
-    4. 如果工具返回 ERROR 或 DENIED，不要重复同样的调用，要根据错误信息调整做法。
+    4. 如果工具返回 ERROR 或 DENIED，不要重复同样的调用，要根据错误信息调整做法。若是目录权限不足，客户端会申请权限并自动继续当前步骤。
     5. 如果用户明确给出了文件路径、文件名或目标目录，必须严格使用该路径/名称，不要自行改名，也不要省略路径。
     6. 如果用户给的是目录，创建或修改文件时要把文件放进那个目录里；不要因为 workspace 可写就回退写到 workspace 根目录。
     7. 全部完成后再用自然语言给出简短总结，不要提前宣称完成。
 
     约束：
     - 所有文件操作都被限制在当前 workspace 目录内，越界会被拒绝。
-    - 用户额外授权的附件文件/目录，以及用户在本轮消息里明确指定并已授权的目标路径，都可以直接用绝对路径访问；未授权的绝对路径不能碰。
+    - 用户额外授权的附件文件/目录可以直接用绝对路径访问；未授权的绝对路径不能碰。若工具碰到未授权目录，客户端会申请该目录权限后续跑。
+    - run_cmd 只执行单条命令。默认已在 workspace 根目录运行，不要写 `cd xxx && ...`；只有确实要切到子目录时，才允许这种单次切目录形式，不能再叠加别的命令拼接。
     - 只能执行白名单内的命令，不支持管道与重定向。
     - 总结里必须写出实际创建/修改的文件路径；如果写入失败，要明确说明失败原因。
     - 用中文回复。
@@ -51,11 +52,22 @@ struct AgentEngine: Sendable {
     /// 执行一次工具调用。由界面层注入，以便在真正落盘前插入「人工确认」。
     typealias Executor = @Sendable (ToolInvocation, UUID) async -> ToolExecutionResult
 
-    func run(task: String, executor: @escaping Executor) -> AsyncThrowingStream<AgentEvent, Error> {
+    func run(
+        task: String,
+        history: [ChatMessage] = [],
+        bootstrap: String = "",
+        executor: @escaping Executor
+    ) -> AsyncThrowingStream<AgentEvent, Error> {
         AsyncThrowingStream<AgentEvent, Error> { continuation in
             let work = Task {
                 do {
-                    try await loop(task: task, executor: executor, emit: { continuation.yield($0) })
+                    try await loop(
+                        task: task,
+                        history: history,
+                        bootstrap: bootstrap,
+                        executor: executor,
+                        emit: { continuation.yield($0) }
+                    )
                     continuation.finish()
                 } catch is CancellationError {
                     continuation.finish()
@@ -72,10 +84,19 @@ struct AgentEngine: Sendable {
 
     private func loop(
         task: String,
+        history: [ChatMessage],
+        bootstrap: String,
         executor: @escaping Executor,
         emit: @escaping @Sendable (AgentEvent) -> Void
     ) async throws {
-        var messages: [ChatMessage] = [.system(Self.systemPrompt), .user(task)]
+        // 消息顺序：系统提示词 → 本次会话装载（记忆 / 技能） → 历史轮次 → 本轮提问。
+        // 装载块单独作为一条 system 消息，压缩阶段不会破坏它，也不会占用 tool_call 配对。
+        var messages: [ChatMessage] = [.system(Self.systemPrompt)]
+        if !bootstrap.isEmpty {
+            messages.append(.system(bootstrap))
+        }
+        messages += history
+        messages.append(.user(task))
         var emptyRetries = 0
         var repeatCounts: [String: Int] = [:]
 
@@ -347,7 +368,8 @@ struct AgentEngine: Sendable {
         guard messages.count > keepRecent + 2 else { return }
 
         let cutoff = messages.count - keepRecent
-        for index in 2..<cutoff {
+        // 从 1 开始：保留 system 提示词，其余（含历史轮次）都允许被裁剪。
+        for index in 1..<cutoff {
             let text = messages[index].content
             guard text.count > 120 else { continue }
 
